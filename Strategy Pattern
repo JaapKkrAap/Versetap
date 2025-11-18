@@ -1,0 +1,206 @@
+import requests
+from bs4 import BeautifulSoup
+import re
+import json
+import os
+import time
+import random
+from urllib.parse import quote_plus
+
+# --- Configuration & Constants ---
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
+]
+
+class LyricScraperError(Exception):
+    """Custom exception for handling scraping errors."""
+    pass
+
+# --- Helper Functions ---
+def clean_text(text):
+    """
+    Cleans the raw lyric text.
+    - Removes extra whitespace
+    - Standardizes line breaks
+    - Removes common ad-insertion artifacts
+    """
+    if not text:
+        return ""
+    
+    # Remove content inside brackets that usually denotes structure like [Chorus]
+    # Optional: Keep this if metadata is desired, but removing makes for cleaner NLP
+    # text = re.sub(r'\[.*?\]', '', text) 
+    
+    text = text.strip()
+    text = re.sub(r'\r\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text) # Max 2 newlines
+    return text
+
+def normalize_input(text):
+    """Normalizes artist/song names for URL construction (lowercase, no symbols)."""
+    text = text.lower().strip()
+    text = re.sub(r'[^a-z0-9]', '', text)
+    return text
+
+# --- Source Strategies ---
+
+class BaseSource:
+    """Interface for lyric sources."""
+    def get_lyrics(self, artist, title):
+        raise NotImplementedError
+
+class AZLyricsSource(BaseSource):
+    """
+    Primary Source: AZLyrics
+    Strategy: Direct URL construction based on strict naming conventions.
+    """
+    BASE_URL = "https://www.azlyrics.com/lyrics"
+
+    def get_lyrics(self, artist, title):
+        # AZLyrics constructs URLs like: /lyrics/artistname/songtitle.html
+        norm_artist = normalize_input(artist)
+        norm_title = normalize_input(title)
+        
+        url = f"{self.BASE_URL}/{norm_artist}/{norm_title}.html"
+        print(f"[*] Attempting AZLyrics: {url}")
+
+        try:
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # AZLyrics extraction logic (specific to their HTML structure)
+            # They often wrap lyrics in a div with no class, preceded by a specific comment
+            # This is a heuristic search for the correct div
+            main_div = soup.find('div', {'class': 'col-xs-12 col-lg-8 text-center'})
+            if not main_div:
+                return None
+            
+            # Finding the div that has no class and contains the lyrics
+            divs = main_div.find_all('div', recursive=False)
+            lyric_div = None
+            for div in divs:
+                if not div.has_attr('class') and not div.has_attr('id'):
+                    lyric_div = div
+                    break
+            
+            if lyric_div:
+                # Replace <br> with newlines before getting text
+                for br in lyric_div.find_all("br"):
+                    br.replace_with("\n")
+                return clean_text(lyric_div.get_text())
+                
+        except Exception as e:
+            print(f"[!] Error scraping AZLyrics: {e}")
+            return None
+        return None
+
+class GenericSearchSource(BaseSource):
+    """
+    Backup Source: Generic Search Fallback
+    Strategy: Uses a search engine query structure (simulated) or a secondary API.
+    For this demo, we simulate a secondary fallback to a different structure.
+    """
+    def get_lyrics(self, artist, title):
+        print(f"[*] Attempting Backup Source for: {artist} - {title}")
+        # In a real production env, this would hit an API like Genius or MusicMatch
+        # For this code to be runnable without API keys, we return None to simulate "Not Found"
+        # unless you implement specific scraping for a second site here.
+        return None
+
+# --- Main Controller ---
+
+class LyricDownloader:
+    def __init__(self):
+        self.sources = [
+            AZLyricsSource(),
+            GenericSearchSource()
+            # Add more sources here easily
+        ]
+
+    def fetch(self, artist, title):
+        """
+        Iterates through sources until lyrics are found.
+        """
+        print(f"--- Starting Search: {artist} - {title} ---")
+        
+        for source in self.sources:
+            lyrics = source.get_lyrics(artist, title)
+            if lyrics:
+                print("[+] Lyrics found!")
+                return {
+                    "artist": artist,
+                    "title": title,
+                    "lyrics": lyrics,
+                    "source": source.__class__.__name__
+                }
+            time.sleep(1) # Polite delay between source switches
+            
+        print("[-] Lyrics not found in any configured source.")
+        return None
+
+    def export(self, data, format_type='txt', output_dir='downloads'):
+        """
+        Handles exporting to TXT, MD, or JSON.
+        """
+        if not data:
+            return
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        filename = f"{normalize_input(data['artist'])}_{normalize_input(data['title'])}"
+        
+        if format_type == 'json':
+            path = os.path.join(output_dir, f"{filename}.json")
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+                
+        elif format_type == 'md':
+            path = os.path.join(output_dir, f"{filename}.md")
+            with open(path, 'w', encoding='utf-8') as f:
+                md_content = f"""---
+title: {data['title']}
+artist: {data['artist']}
+source: {data['source']}
+---
+
+# {data['title']} by {data['artist']}
+
+{data['lyrics']}
+"""
+                f.write(md_content)
+
+        else: # Default TXT
+            path = os.path.join(output_dir, f"{filename}.txt")
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(f"{data['title']} - {data['artist']}\n\n")
+                f.write(data['lyrics'])
+                
+        print(f"[✓] Saved to {path}")
+
+# --- Usage Example ---
+
+if __name__ == "__main__":
+    downloader = LyricDownloader()
+    
+    # Example Input
+    songs_to_find = [
+        ("Taylor Swift", "Love Story"),
+        ("Queen", "Bohemian Rhapsody"),
+        ("NonExistentBand", "FakeSong123") # Test Error Handling
+    ]
+
+    for artist, song in songs_to_find:
+        result = downloader.fetch(artist, song)
+        if result:
+            # Export in all formats to demonstrate capabilities
+            downloader.export(result, 'txt')
+            downloader.export(result, 'md')
+            downloader.export(result, 'json')
+        print("-" * 30)
